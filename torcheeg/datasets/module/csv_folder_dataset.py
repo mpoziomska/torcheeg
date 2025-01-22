@@ -5,88 +5,40 @@ import numpy as np
 
 from .base_dataset import BaseDataset
 from ...utils import get_random_dir_path
+import logging
+import gc
 
+from eegunirep.utils.electrode_utils import CHAN_LIST, CHNAMES_MAPPING, apply_mor_data_hack_fix
 
-def default_read_fn(file_path, **kwargs):
-    # Load EEG file
-    raw = mne.io.read_raw(file_path)
-    # Convert raw to epochs
-    epochs = mne.make_fixed_length_epochs(raw, duration=1)
-    # Return EEG data
-    return epochs
+import warnings
+from scipy.signal import BadCoefficients
 
+log = logging.getLogger('torcheeg')
+
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 class CSVFolderDataset(BaseDataset):
-    '''
-    Read meta information from CSV file and read EEG data from folder according to the meta information. The CSV file should contain the following columns:
-
-    - ``subject_id`` (Optional): The subject id of the EEG data. Commonly used in training and testing dataset split.
-    - ``label`` (Optional): The label of the EEG data. Commonly used in training and testing dataset split.
-    - ``file_path`` (Required): The path to the EEG data file.
-
-    .. code-block:: python
-
-        # data.csv
-        # | subject_id | trial_id | label | file_path                 |
-        # | ---------- | -------  | ----- | ------------------------- |
-        # | sub1       | 0        | 0     | './data/label1/sub1.fif' |
-        # | sub1       | 1        | 1     | './data/label2/sub1.fif' |
-        # | sub1       | 2        | 2     | './data/label3/sub1.fif' |
-        # | sub2       | 0        | 0     | './data/label1/sub2.fif' |
-        # | sub2       | 1        | 1     | './data/label2/sub2.fif' |
-        # | sub2       | 2        | 2     | './data/label3/sub2.fif' |
-
-        from torcheeg.datasets import CSVFolderDataset
-        from torcheeg import transforms
-
-        def default_read_fn(file_path, **kwargs):
-            # Load EEG file
-            raw = mne.io.read_raw(file_path)
-            # Convert raw to epochs
-            epochs = mne.make_fixed_length_epochs(raw, duration=1)
-            # Return EEG data
-            return epochs
-
-        dataset = CSVFolderDataset(csv_path='./data.csv',
-                                   read_fn=default_read_fn,
-                                   online_transform=transforms.ToTensor(),
-                                   label_transform=transforms.Select('label'),
-                                   num_worker=4)
-
-    Args:
-        csv_path (str): The path to the CSV file.
-        read_fn (Callable): Method for reading files in a folder. By default, this class provides methods for reading files using :obj:`mne.io.read_raw`. At the same time, we allow users to pass in custom file reading methods. The first input parameter of whose is file_path, and other parameters are additional parameters passed in when the class is initialized. For example, you can pass :obj:`chunk_size=32` to :obj:`FolderDataset`, then :obj:`chunk_size` will be received here.
-        online_transform (Callable, optional): The transformation of the EEG signals and baseline EEG signals. The input is a :obj:`np.ndarray`, and the ouput is used as the first and second value of each element in the dataset. (default: :obj:`None`)
-        offline_transform (Callable, optional): The usage is the same as :obj:`online_transform`, but executed before generating IO intermediate results. (default: :obj:`None`)
-        label_transform (Callable, optional): The transformation of the label. The input is an information dictionary, and the ouput is used as the third value of each element in the dataset. (default: :obj:`None`)
-        io_path (str): The path to generated unified data IO, cached as an intermediate result. If set to None, a random path will be generated. (default: :obj:`None`)
-        io_size (int): Maximum size database may grow to; used to size the memory mapping. If database grows larger than ``map_size``, an exception will be raised and the user must close and reopen. (default: :obj:`1048576`)
-        io_mode (str): Storage mode of EEG signal. When io_mode is set to :obj:`lmdb`, TorchEEG provides an efficient database (LMDB) for storing EEG signals. LMDB may not perform well on limited operating systems, where a file system based EEG signal storage is also provided. When io_mode is set to :obj:`pickle`, pickle-based persistence files are used. When io_mode is set to :obj:`memory`, memory are used. (default: :obj:`lmdb`)
-        num_worker (int): Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process. (default: :obj:`0`)
-        verbose (bool): Whether to display logs during processing, such as progress bars, etc. (default: :obj:`True`)
-    '''
-
     def __init__(self,
+                 config,
                  csv_path: str = './data.csv',
-                 read_fn: Union[None, Callable] = default_read_fn,
                  online_transform: Union[None, Callable] = None,
-                 offline_transform: Union[None, Callable] = None,
                  label_transform: Union[None, Callable] = None,
                  io_path: Union[None, str] = None,
-                 io_size: int = 1048576,
+                 io_size: int = (1048576 * (2**6)),
                  io_mode: str = 'lmdb',
                  num_worker: int = 0,
                  verbose: bool = True,
                  **kwargs):
+        self.config = config
         if io_path is None:
             io_path = get_random_dir_path(dir_prefix='datasets')
 
-        # pass all arguments to super class
         params = {
             'csv_path': csv_path,
-            'read_fn': read_fn,
+            'read_fn': None,
             'online_transform': online_transform,
-            'offline_transform': offline_transform,
+            'offline_transform': None,
             'label_transform': label_transform,
             'io_path': io_path,
             'io_size': io_size,
@@ -94,13 +46,13 @@ class CSVFolderDataset(BaseDataset):
             'num_worker': num_worker,
             'verbose': verbose
         }
+
         params.update(kwargs)
         super().__init__(**params)
         # save all arguments to __dict__
         self.__dict__.update(params)
 
-    @staticmethod
-    def process_record(file: Any = None,
+    def process_record(self, file: Any = None,
                        offline_transform: Union[None, Callable] = None,
                        read_fn: Union[None, Callable] = None,
                        **kwargs):
@@ -108,38 +60,63 @@ class CSVFolderDataset(BaseDataset):
         trial_info = file
         file_path = trial_info['file_path']
 
-        trial_samples = read_fn(file_path, **kwargs)
-        events = [i[0] for i in trial_samples.events]
-        events.append(
-            events[-1] +
-            np.diff(events)[0])  # time interval between all events are same
+        # log.info(f"FILE PATH {file_path}")
+        edf = mne.io.read_raw_edf(input_fname=file_path, preload=True)
+        edf = apply_mor_data_hack_fix(edf=edf, edf_path=file_path, institution_id=trial_info['institution_id'])
+        with mne.utils.use_log_level("error"):
+            # ujednolica nazwy elektrod oraz ich kolejność,
+            # jeśli nie da rady, bo np. brak wystarczającej ilości
+            # elektrod, to rzuca wyjątkiem
+            i = 0
+            while True:
+                try:
+                    edf = edf.rename_channels(CHNAMES_MAPPING[i])
+                    edf = edf.reorder_channels(CHAN_LIST)
+                    break
+                except ValueError:
+                    i += 1
 
-        write_pointer = 0
-        for i, trial_signal in enumerate(trial_samples.get_data()):
-            t_eeg = trial_signal
-            if not offline_transform is None:
-                t = offline_transform(eeg=trial_signal)
-                t_eeg = t['eeg']
+                if i == len(CHNAMES_MAPPING):
+                    raise ValueError(
+                        f"channels rename/reordering error, available channels\n{edf.info['ch_names']}"
+                        f", required channels: {CHAN_LIST}"
+                    )
 
-            clip_id = f'{file_path}_{write_pointer}'
-            write_pointer += 1
+        edf: mne.io.Raw = edf.set_montage("standard_1020", match_case=False) # Czy to jest potrzebne?
+        Fs = edf.info['sfreq']
+        new_Fs = self.config['preprocess']['new_Fs']
 
-            record_info = {
-                **trial_info, 'start_at': events[i],
-                'end_at': events[i + 1],
-                'clip_id': clip_id
+        f_stop = self.config['preprocess']['f_stop']
+        f_pass = self.config['preprocess']['f_pass']
+        
+        iir_params = dict(ftype='butter', output='sos', gpass=1, gstop=20)
+        
+        iir_params = mne.filter.construct_iir_filter(iir_params,
+                                                    f_pass=f_pass,
+                                                    f_stop=f_stop,
+                                                    sfreq=Fs,
+                                                    btype='lowpass',
+                                                    return_copy=False)
+
+        edf = edf.filter(iir_params=iir_params, l_freq=0, h_freq=0, method='iir')
+        edf = edf.resample(sfreq=new_Fs)
+
+        eeg_raw_signal = edf.get_data(picks=CHAN_LIST, units='uV', tmin=self.config['preprocess']['tmin_s'], tmax=self.config['preprocess']['tmax_s'])[:, None]
+        eid = file_path.split('/')[-1]
+        record_info = {
+                **trial_info, 'Fs': new_Fs,
+                'clip_id': eid
             }
-
-            yield {'eeg': t_eeg, 'key': clip_id, 'info': record_info}
+        for i in range(1):
+            yield {'eeg': eeg_raw_signal, 'key': eid, 'info': record_info}
 
     def set_records(self, csv_path: str = './data.csv', **kwargs):
         # read csv
-        df = pd.read_csv(csv_path)
-
-        assert 'file_path' in df.columns, 'file_path is required in csv file.'
+        df_info = pd.read_csv(csv_path)
+        assert 'file_path' in df_info.columns, 'file_path is required in csv file.'
 
         # df to a list of dict, each dict is a row
-        df_list = df.to_dict('records')
+        df_list = df_info.to_dict('records')
 
         return df_list
 
@@ -148,18 +125,22 @@ class CSVFolderDataset(BaseDataset):
 
         eeg_index = str(info['clip_id'])
         eeg_record = str(info['_record_id'])
-        eeg = self.read_eeg(eeg_record, eeg_index)
+        eeg = self.read_eeg(eeg_record, eeg_index).reshape(len(CHAN_LIST), -1)
 
         signal = eeg
         label = info
 
         if self.online_transform:
-            signal = self.online_transform(eeg=eeg)['eeg']
+            try:
+                signal = self.online_transform(eeg)
+            except TypeError:
+                signal = self.online_transform(eeg=eeg)
 
         if self.label_transform:
             label = self.label_transform(y=info)['y']
-
-        return signal, label
+        # del eeg
+        # gc.collect()
+        return signal, label, info
 
     @property
     def repr_body(self) -> Dict:

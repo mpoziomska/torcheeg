@@ -32,6 +32,7 @@ class MetaInfoIO:
     '''
     def __init__(self, io_path: str) -> None:
         self.io_path = io_path
+        self.eid_to_idx_dict = {}
         if not os.path.exists(self.io_path):
             os.makedirs(os.path.dirname(io_path), exist_ok=True)
             open(self.io_path, 'x').close()
@@ -55,6 +56,8 @@ class MetaInfoIO:
         Returns:
             int: The index of written EEG description in the table.
         '''
+        self.eid_to_idx_dict[obj['examination_id']] = self.write_pointer
+        obj['save_idx'] = self.write_pointer
         with open(self.io_path, 'a+') as f:
             require_head = os.path.getsize(self.io_path) == 0
             writer = csv.DictWriter(f, fieldnames=list(obj.keys()))

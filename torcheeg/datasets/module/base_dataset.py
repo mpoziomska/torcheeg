@@ -10,9 +10,14 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from torcheeg.io import EEGSignalIO, MetaInfoIO
+import gc
 
 log = logging.getLogger('torcheeg')
-
+consoleHandler = logging.StreamHandler()
+logFormatter = logging.Formatter("%(asctime)s [%(name)s] [%(levelname)-5.5s]  %(message)s")
+consoleHandler.setFormatter(logFormatter)
+log.addHandler(consoleHandler)
+log.setLevel('INFO')
 
 class BaseDataset(Dataset):
 
@@ -131,17 +136,21 @@ class BaseDataset(Dataset):
                     # shutil to delete the database
                     shutil.rmtree(self.io_path)
                     raise e
+            self.info.to_csv(f"{self.io_path}/all_info.csv")
         else:
             log.info(
                 f'🔍 | Detected cached processing results, reading cache from {self.io_path}.'
             )
             # get all records
-            records = os.listdir(io_path)
-            # filter the records with the prefix '_record_'
-            records = list(filter(lambda x: '_record_' in x, records))
+            if kwargs['csv_path'] is None:
+                df_info = pd.read_csv(f"{self.io_path}/all_info.csv")
+            else:
+                df_info = pd.read_csv(kwargs['csv_path'])
+            # read records list from csv file
+            records = df_info._record_id.values
             # sort the records
             records = sorted(records, key=lambda x: int(x.split('_')[2]))
-
+            log.info(f"len df_info: {len(df_info)}, len records: {len(records)}")
             # for every record, get the io_path, and init the info_io and eeg_io
             eeg_io_router = {}
             info_merged = []
@@ -150,8 +159,7 @@ class BaseDataset(Dataset):
                 records
             ) > 0, "The io_path, {}, is corrupted. Please delete this folder and try again.".format(
                 io_path)
-
-            for record in records:
+            for record in tqdm(records, desc="Loading data..."):
                 meta_info_io_path = os.path.join(io_path, record, 'info.csv')
                 eeg_signal_io_path = os.path.join(io_path, record, 'eeg')
                 info_io = MetaInfoIO(meta_info_io_path)
@@ -169,6 +177,8 @@ class BaseDataset(Dataset):
 
             self.eeg_io_router = eeg_io_router
             self.info = pd.concat(info_merged, ignore_index=True)
+            del records, info_merged, eeg_io_router, info_df, meta_info_io_path, df_info
+            gc.collect()
 
     def set_records(self, **kwargs):
         '''

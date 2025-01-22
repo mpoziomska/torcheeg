@@ -1,6 +1,7 @@
 import pickle
 import os
 from typing import Union
+import numpy as np
 
 import torch
 import lmdb
@@ -238,8 +239,10 @@ class PickleEEGSignalIO(_EEGSignalIO):
         if eeg is None:
             raise RuntimeError(f'Save None to the LMDB with the key {key}!')
 
-        with open(os.path.join(self.io_path, key), 'wb') as f:
-            pickle.dump(eeg, f)
+        # with open(os.path.join(self.io_path, key), 'wb') as f:
+        #     pickle.dump(eeg, f)
+        
+        eeg.tofile(os.path.join(self.io_path, key))
 
         return key
 
@@ -253,9 +256,10 @@ class PickleEEGSignalIO(_EEGSignalIO):
             Returns:
                 any: The EEG signal sample.
             '''
-        with open(os.path.join(self.io_path, key), 'rb') as f:
-            eeg = pickle.load(f)
+        # with open(os.path.join(self.io_path, key), 'rb') as f:
+        #     eeg = pickle.load(f)
 
+        eeg = np.fromfile(os.path.join(self.io_path, key))
         return eeg
 
     def keys(self):
